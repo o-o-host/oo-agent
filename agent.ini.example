@@ -1,0 +1,35 @@
+; oo-agent configuration.
+; Copy to /etc/oo-agent/agent.ini and adjust.
+
+[agent]
+; Base metrics collection interval, seconds.
+interval = 60
+; Inventory snapshot interval (SMART details, container list, sensor
+; topology, GPU models), seconds.
+inventory_interval = 600
+; Logging level: DEBUG, INFO, WARNING, ERROR.
+log_level = INFO
+; Directory with custom drop-in collectors (*.py).
+; plugins_dir = /etc/oo-agent/plugins
+
+; Transport section is used by the daemon mode (not needed for --dump).
+[transport]
+; Backend base URL; the agent pushes to <server>/agent/v1/metrics.
+; server = https://api.o-o.host
+; Agent token file, written by the enroll flow (mode 0600).
+; token_file = /etc/oo-agent/agent.token
+; Inline token overrides token_file (not recommended).
+; token =
+; Offline buffer (sqlite). Payloads queue up here while the backend
+; is unreachable and are re-sent oldest-first.
+; queue_path = /var/lib/oo-agent/queue.db
+; queue_max_rows = 5000
+; queue_max_age_hours = 24
+; HTTP timeout, seconds.
+; timeout = 10
+; verify_tls = true
+
+; Per-collector overrides. Section name: [collector:<name>].
+; [collector:docker]
+; enabled = false
+; interval = 120
