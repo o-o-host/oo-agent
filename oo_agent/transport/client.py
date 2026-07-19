@@ -85,6 +85,13 @@ class TransportClient:
         self.verify = bool(options.get("verify_tls", True))
         self._http_transport = http_transport  # test seam (httpx.MockTransport)
         self._http = None
+        #: HTTP status of the last authorization rejection (401/403/410),
+        #: None after any accepted push. The daemon watches this to switch
+        #: into re-enrollment when the token has been invalidated.
+        self.auth_status: int | None = None
+        #: Backend instructions from the last accepted push response
+        #: (e.g. ``{"update": true}``); {} when the body carried none.
+        self.server_commands: dict[str, Any] = {}
 
     @property
     def configured(self) -> bool:
@@ -127,10 +134,19 @@ class TransportClient:
                 error = str(exc) or exc.__class__.__name__
             else:
                 if response.status_code < 300:
+                    self.auth_status = None
+                    try:
+                        data = response.json()
+                    except ValueError:
+                        data = None
+                    self.server_commands = data if isinstance(data, dict) else {}
                     return True
                 if 400 <= response.status_code < 500:
-                    # The same body cannot succeed later; 401/403 also
-                    # land here — an operator has to re-enroll anyway.
+                    # The same body cannot succeed later — drop it. An
+                    # invalidated token (401/403) or a deleted resource
+                    # (410) is remembered so the daemon can re-enroll.
+                    if response.status_code in (401, 403, 410):
+                        self.auth_status = response.status_code
                     log.warning(
                         "metrics rejected (HTTP %d): %s",
                         response.status_code,

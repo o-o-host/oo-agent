@@ -4,10 +4,14 @@ Wants=network-online.target
 After=network-online.target docker.service
 
 [Service]
-Type=simple
+Type=notify
 ExecStart=/opt/oo-agent/venv/bin/oo-agent
-Restart=on-failure
-RestartSec=10
+# Always come back: crashes, OOM kills, kill -9 — anything.
+Restart=always
+RestartSec=5
+# The agent pings the watchdog every second from its main loop; a hung
+# collector or a stuck subprocess gets the whole process restarted.
+WatchdogSec=90
 # Sensors, SMART and GPU BAR reads need root; everything else is
 # best-effort and degrades gracefully without it.
 User=root

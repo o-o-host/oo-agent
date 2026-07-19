@@ -16,11 +16,27 @@ from oo_agent.core.scheduler import Scheduler
 
 log = logging.getLogger("agent")
 
+# Consecutive auth rejections (401/403/410) before the daemon wipes its
+# token and switches to the re-claim flow.
+_AUTH_FAIL_LIMIT = 3
+# The backend may ask for a self-update in a push response; honour it at
+# most once per hour so a broken manifest cannot cause a retry storm.
+_UPDATE_THROTTLE = 3600.0
+
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="oo-agent",
         description="Lightweight metrics collection agent.",
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=("run", "uninstall", "update"),
+        default="run",
+        help="run (default) starts the agent; uninstall removes the "
+        "service, config and token from this machine; update fetches "
+        "the version manifest and self-updates when newer",
     )
     parser.add_argument("--config", metavar="PATH", help="path to agent.ini")
     parser.add_argument(
@@ -50,6 +66,14 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         metavar="URL",
         help="backend URL (overrides 'server' in the [transport] section)",
     )
+    parser.add_argument(
+        "--yes", action="store_true",
+        help="uninstall: do not ask for confirmation",
+    )
+    parser.add_argument(
+        "--check", action="store_true",
+        help="update: only report whether a newer version exists",
+    )
     parser.add_argument("--log-level", metavar="LEVEL", help="override log level")
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {__version__}"
@@ -64,13 +88,34 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    setup_logging(args.log_level or str(config.agent["log_level"]))
+    setup_logging(
+        args.log_level or str(config.agent["log_level"]),
+        str(config.agent.get("log_file", "") or ""),
+    )
     if config.path:
         log.info("config: %s", config.path)
 
     transport_options = dict(config.transport)
     if args.server:
         transport_options["server"] = args.server
+
+    if args.command == "uninstall":
+        from oo_agent import lifecycle
+
+        return lifecycle.uninstall(assume_yes=args.yes)
+
+    if args.command == "update":
+        from oo_agent import lifecycle
+
+        server = str(transport_options.get("server", ""))
+        if not server:
+            print("error: no backend URL — pass --server or set 'server' "
+                  "in the [transport] config section", file=sys.stderr)
+            return 2
+        verify = bool(transport_options.get("verify_tls", True))
+        if args.check:
+            return lifecycle.print_update_state(server, verify)
+        return lifecycle.self_update(server, verify)
 
     if args.enroll is not None:
         return _do_enroll(transport_options, args.enroll)
@@ -106,7 +151,10 @@ def run_daemon(config_path: str | None = None, should_stop=None) -> None:
     """Full daemon lifecycle for service wrappers (systemd is fine with
     main(), the Windows service needs a stop callback)."""
     config = AgentConfig(config_path)
-    setup_logging(str(config.agent["log_level"]))
+    setup_logging(
+        str(config.agent["log_level"]),
+        str(config.agent.get("log_file", "") or ""),
+    )
     entries = discover(config)
     scheduler = Scheduler(entries)
     sink = _build_sink(dict(config.transport))
@@ -144,7 +192,14 @@ def _do_enroll(transport_options: dict, code: str) -> int:
 
 def _build_sink(transport_options: dict):
     """Daemon sink: push to the backend when transport is configured,
-    buffering through the on-disk queue; otherwise log payload sizes."""
+    buffering through the on-disk queue; otherwise log payload sizes.
+
+    Wraps the plain push with two lifecycle behaviours:
+    - token invalidated (consecutive 401/403/410) -> wipe the token and
+      run the non-blocking re-claim flow until a new one is issued;
+    - backend replies with an update instruction -> self-update in a
+      background thread (the service restart is detached).
+    """
 
     def log_sink(payload: dict) -> None:
         log.info(
@@ -183,8 +238,68 @@ def _build_sink(transport_options: dict):
     except (OSError, sqlite3.Error) as exc:
         log.warning("queue unavailable (%s) — offline buffering off", exc)
 
+    state = {"auth_fails": 0, "reclaim": None, "updating": False,
+             "last_update": 0.0}
+
+    def _maybe_self_update() -> None:
+        import time as _time
+
+        if not client.server_commands.get("update"):
+            return
+        now = _time.monotonic()
+        if state["updating"] or now - state["last_update"] < _UPDATE_THROTTLE:
+            return
+        state["updating"] = True
+        state["last_update"] = now
+
+        def _worker() -> None:
+            from oo_agent import lifecycle
+
+            try:
+                lifecycle.self_update(client.server, client.verify)
+            finally:
+                state["updating"] = False
+
+        import threading
+
+        log.info("backend requested a self-update")
+        threading.Thread(target=_worker, daemon=True).start()
+
     def push_sink(payload: dict) -> None:
+        flow = state["reclaim"]
+        if flow is not None:
+            token = flow.step()
+            if token:
+                client.token = token
+                state["reclaim"] = None
+                state["auth_fails"] = 0
+                flow.close()
+            return  # while unenrolled there is nowhere to push
+
         if client.push(payload):
+            if client.auth_status is not None:
+                state["auth_fails"] += 1
+                if state["auth_fails"] >= _AUTH_FAIL_LIMIT:
+                    log.warning(
+                        "token rejected %d times (HTTP %d) — wiping it and "
+                        "waiting for the server to be re-added in the UI",
+                        state["auth_fails"], client.auth_status,
+                    )
+                    import os
+
+                    from oo_agent.transport.reclaim import ReclaimFlow
+
+                    try:
+                        os.remove(client.token_file)
+                    except OSError:
+                        pass
+                    client.token = ""
+                    state["reclaim"] = ReclaimFlow(
+                        client.server, client.token_file, client.verify
+                    )
+                return
+            state["auth_fails"] = 0
+            _maybe_self_update()
             if queue is not None and len(queue):
                 sent = drain(queue, client)
                 if sent:

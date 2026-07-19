@@ -2,8 +2,10 @@
 
 Single-threaded loop: collectors are cheap (reads of /proc, /sys and
 library calls), so they run sequentially at their own intervals. A
-collector that raises is disabled until restart (WARN once) — the
-agent itself never dies because of one broken source.
+collector that raises backs off with an exponentially growing cooldown
+and is retried — one transient hiccup (a Docker API timeout, a busy
+SMART device) must not silence a source until restart. The agent
+itself never dies because of one broken collector.
 """
 
 from __future__ import annotations
@@ -12,10 +14,15 @@ import logging
 import time
 from typing import Any, Callable
 
+from oo_agent.core import sdnotify
 from oo_agent.core.hostinfo import agent_info
 from oo_agent.core.registry import Entry
 
 log = logging.getLogger("scheduler")
+
+# Failure cooldown: 5 min after the first failure, doubling up to 1 h.
+_BACKOFF_BASE = 300.0
+_BACKOFF_MAX = 3600.0
 
 # Metric key prefix per sensor unit for the flat numeric channel.
 _SENSOR_METRIC = {
@@ -28,18 +35,23 @@ _SENSOR_METRIC = {
 
 
 def _run_entry(entry: Entry) -> dict[str, Any] | None:
-    """One isolated collect() call; disables the entry on failure."""
+    """One isolated collect() call; backs the entry off on failure."""
     try:
         started = time.monotonic()
         payload = entry.collector.collect() or {}
         elapsed = time.monotonic() - started
         if elapsed > 5:
             log.warning("collector %s: slow collect (%.1fs)", entry.name, elapsed)
+        entry.failures = 0
+        entry.retry_at = 0.0
         return payload
     except Exception as exc:  # noqa: BLE001 - isolation by design
-        entry.disabled = True
+        entry.failures += 1
+        cooldown = min(_BACKOFF_BASE * 2 ** (entry.failures - 1), _BACKOFF_MAX)
+        entry.retry_at = time.monotonic() + cooldown
         log.warning(
-            "collector %s: failed, disabled until restart: %s", entry.name, exc
+            "collector %s: failed (attempt %d), retrying in %d min: %s",
+            entry.name, entry.failures, int(cooldown // 60), exc,
         )
         log.debug("collector %s traceback", entry.name, exc_info=True)
         return None
@@ -72,7 +84,8 @@ class Scheduler:
         return [e for e in self.entries if not e.disabled]
 
     def capabilities(self) -> list[str]:
-        return sorted(e.name for e in self._active())
+        now = time.monotonic()
+        return sorted(e.name for e in self._active() if now >= e.retry_at)
 
     def run_once(self, include: Callable[[Entry], bool] = lambda e: True) -> dict:
         """Run matching collectors now and assemble one push payload."""
@@ -106,12 +119,14 @@ class Scheduler:
         once per tick so a service wrapper can request a clean exit.
         """
         next_run: dict[str, float] = {e.name: 0.0 for e in self.entries}
+        sdnotify.ready()
         while should_stop is None or not should_stop():
+            sdnotify.watchdog_ping()
             now = time.monotonic()
             due = [
                 e
                 for e in self._active()
-                if now >= next_run.get(e.name, 0.0)
+                if now >= next_run.get(e.name, 0.0) and now >= e.retry_at
             ]
             if due:
                 for entry in due:

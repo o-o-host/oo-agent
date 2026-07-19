@@ -12,9 +12,14 @@
 #   --server URL    backend base URL, written into agent.ini
 #   --enroll        run the enroll flow after install (IP-claim)
 #   --enroll CODE   run the enroll flow with a one-time code
+#   --force         re-enroll even when a token is already present
+#                   (reinstall over an existing agent: the old token is
+#                   discarded and the enroll flow runs again)
 #   --src DIR       source tree to install from (default: repo root
 #                   relative to this script)
 #   --no-start      install everything but do not enable/start the unit
+#
+# To remove the agent later: oo-agent uninstall
 
 set -euo pipefail
 
@@ -27,6 +32,7 @@ SERVER=""
 ENROLL=""
 DO_ENROLL=0
 NO_START=0
+FORCE=0
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 while [ $# -gt 0 ]; do
@@ -38,6 +44,7 @@ while [ $# -gt 0 ]; do
             shift ;;
         --src) SRC="$2"; shift 2 ;;
         --no-start) NO_START=1; shift ;;
+        --force) FORCE=1; shift ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -81,15 +88,24 @@ fi
 
 install -m 644 "$SRC/deploy/linux/oo-agent.service" "$UNIT_DST"
 systemctl daemon-reload
+# The CLI on PATH: `oo-agent update` / `oo-agent uninstall` from anywhere.
+ln -sf "$PREFIX/venv/bin/oo-agent" /usr/local/bin/oo-agent
 
 if ! command -v smartctl >/dev/null; then
     echo "note: smartctl not found — install smartmontools for SMART data"
 fi
 
 if [ "$DO_ENROLL" -eq 1 ]; then
-    if [ -f "$CONF_DIR/agent.token" ]; then
-        echo "enroll: token already present, skipping"
+    if [ -f "$CONF_DIR/agent.token" ] && [ "$FORCE" -eq 0 ]; then
+        echo "enroll: token already present, skipping (use --force to re-enroll)"
     else
+        if [ -f "$CONF_DIR/agent.token" ]; then
+            # Reinstall over an existing agent: stop the old daemon so it
+            # does not keep pushing with the token we are about to replace.
+            systemctl stop oo-agent.service 2>/dev/null || true
+            rm -f "$CONF_DIR/agent.token"
+            echo "enroll: discarded the previous token (--force)"
+        fi
         "$PREFIX/venv/bin/oo-agent" --enroll ${ENROLL:+"$ENROLL"}
     fi
 fi

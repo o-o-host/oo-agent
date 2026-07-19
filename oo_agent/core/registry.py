@@ -35,6 +35,7 @@ _BUILTIN_MODULES = (
     "diskio",
     "net",
     "tcpconn",
+    "security",
     "sensors_hwmon",
     "sensors_lhm",
     "smart",
@@ -54,6 +55,10 @@ class Entry:
     custom: bool = False
     disabled: bool = False
     skipped_reason: str | None = field(default=None)
+    # Transient-failure backoff: consecutive failures and the monotonic
+    # time before which the collector is not scheduled again.
+    failures: int = 0
+    retry_at: float = 0.0
 
     @property
     def name(self) -> str:

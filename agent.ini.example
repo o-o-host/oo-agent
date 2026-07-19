@@ -9,6 +9,9 @@ interval = 60
 inventory_interval = 600
 ; Logging level: DEBUG, INFO, WARNING, ERROR.
 log_level = INFO
+; Optional rotated log file (5 MB x 3) in addition to stderr/journal —
+; keeps the reason for a crash visible on hosts without journal history.
+; log_file = /var/log/oo-agent.log
 ; Directory with custom drop-in collectors (*.py).
 ; plugins_dir = /etc/oo-agent/plugins
 

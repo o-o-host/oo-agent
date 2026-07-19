@@ -97,6 +97,7 @@ unit and starts it. Flags:
 - `--server URL` — backend base URL, written into `agent.ini`
 - `--enroll` — run the enroll flow after install (IP-claim)
 - `--enroll CODE` — enroll with a one-time code from the UI
+- `--force` — re-enroll over an existing install (discards the old token)
 - `--no-start` — install everything but do not enable/start the unit
 
 ### Windows
@@ -110,6 +111,21 @@ deploy\windows\build.ps1     # produces dist\oo-agent.exe + setup wizard
 
 `deploy/windows/oo-agent.iss` packages the agent as a Windows service
 with LibreHardwareMonitor bundled for sensor access.
+
+## Update and uninstall
+
+```bash
+sudo oo-agent update       # self-update from the backend's /dl/ manifest
+sudo oo-agent update --check
+sudo oo-agent uninstall    # remove service, config, token and venv
+```
+
+`oo-agent update` fetches `<site>/dl/agent.json`, verifies the tarball
+checksum, upgrades the venv in place and restarts the service — the
+token and config are kept. The backend can also trigger the same
+update remotely by replying `{"update": true}` to a metrics push
+(the "Update agent" button in the UI). On Windows use
+`deploy\windows\uninstall.ps1` from an elevated PowerShell.
 
 ## Configuration
 
