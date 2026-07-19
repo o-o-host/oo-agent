@@ -13,7 +13,8 @@ param(
     [string]$Server = "https://monitor.o-o.host/api",
     [string]$Enroll = "",
     [string]$Source = "https://monitor.o-o.host/dl/oo-agent.tar.gz",
-    [switch]$NoStart
+    [switch]$NoStart,
+    [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
@@ -102,8 +103,16 @@ if ($Server) {
 
 # ── enroll ───────────────────────────────────────────────────────────────
 if ($Enroll) {
-    if (Test-Path (Join-Path $ConfDir "agent.token")) {
-        Write-Host "enroll: token already present, skipping"
+    $tokenFile = Join-Path $ConfDir "agent.token"
+    if ((Test-Path $tokenFile) -and $Force) {
+        # Reinstall over an existing agent: stop the old service so it
+        # does not keep pushing with the token we are about to replace.
+        sc.exe stop oo-agent 2>$null | Out-Null
+        Remove-Item -Force $tokenFile
+        Write-Host "enroll: discarded the previous token (-Force)"
+    }
+    if (Test-Path $tokenFile) {
+        Write-Host "enroll: token already present, skipping (use -Force to re-enroll)"
     } else {
         & (Join-Path $Prefix "venv\Scripts\oo-agent.exe") --enroll $Enroll
         if ($LASTEXITCODE -ne 0) { Fail "enroll failed - check the code and server URL" }
