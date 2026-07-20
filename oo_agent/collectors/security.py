@@ -36,6 +36,8 @@ _REMOTE_ACCESS = re.compile(
 )
 
 _FAILED_SSH = re.compile(r"Failed password|Invalid user")
+_ACCEPTED_SSH = re.compile(r"Accepted ")
+_FROM_IP = re.compile(r"\bfrom (\d{1,3}(?:\.\d{1,3}){3})\b")
 
 
 def _cmd_output(cmd: list[str], timeout: float = 10.0) -> str:
@@ -133,8 +135,8 @@ def firewall_state() -> str:
     return "unknown"
 
 
-def failed_ssh_logins_24h() -> int | None:
-    """Count of failed SSH authentications in the last 24 h."""
+def _ssh_log_lines_24h() -> list[str] | None:
+    """sshd log lines for the last 24 h: journalctl first, else auth.log/secure."""
     if sys.platform == "win32":
         return None
     out = _cmd_output(
@@ -143,21 +145,54 @@ def failed_ssh_logins_24h() -> int | None:
         timeout=20,
     )
     if out:
-        return sum(1 for line in out.splitlines() if _FAILED_SSH.search(line))
+        return out.splitlines()
     for path in ("/var/log/auth.log", "/var/log/secure"):
         try:
             cutoff = time.time() - 86400
             if os.stat(path).st_mtime < cutoff:
                 continue
-            count = 0
             with open(path, errors="replace") as fh:
-                for line in fh:
-                    if _FAILED_SSH.search(line):
-                        count += 1
-            return count
+                return fh.readlines()
         except OSError:
             continue
     return None
+
+
+def _top_sources(counter: dict, limit: int = 10) -> list[dict]:
+    return [{"ip": ip, "count": n}
+            for ip, n in sorted(counter.items(), key=lambda kv: -kv[1])[:limit]]
+
+
+def ssh_activity_24h() -> dict | None:
+    """SSH activity over 24 h: failed count plus the top attacker IPs and the
+    top successful-login IPs (for the security report). None if no log source."""
+    lines = _ssh_log_lines_24h()
+    if lines is None:
+        return None
+    failed = 0
+    failed_ips: dict[str, int] = {}
+    ok_ips: dict[str, int] = {}
+    for line in lines:
+        if _FAILED_SSH.search(line):
+            failed += 1
+            m = _FROM_IP.search(line)
+            if m:
+                failed_ips[m.group(1)] = failed_ips.get(m.group(1), 0) + 1
+        elif _ACCEPTED_SSH.search(line):
+            m = _FROM_IP.search(line)
+            if m:
+                ok_ips[m.group(1)] = ok_ips.get(m.group(1), 0) + 1
+    return {
+        "failed_24h": failed,
+        "failed_sources": _top_sources(failed_ips),
+        "accepted_sources": _top_sources(ok_ips),
+    }
+
+
+def failed_ssh_logins_24h() -> int | None:
+    """Failed-SSH-login count only (kept for backward-compatible callers)."""
+    act = ssh_activity_24h()
+    return None if act is None else act["failed_24h"]
 
 
 def pending_security_updates() -> int | None:
@@ -206,7 +241,8 @@ class SecurityCollector(Collector):
         ports = listening_ports()
         remote = remote_access_services(ports)
         fw = firewall_state()
-        failed = failed_ssh_logins_24h()
+        activity = ssh_activity_24h()
+        failed = activity["failed_24h"] if activity else None
         updates = pending_security_updates()
 
         info: dict = {
@@ -214,8 +250,11 @@ class SecurityCollector(Collector):
             "remote_access": remote,
             "firewall": fw,
         }
-        if failed is not None:
-            info["ssh_failed_24h"] = failed
+        if activity is not None:
+            info["ssh_failed_24h"] = activity["failed_24h"]
+            # top attacker IPs and successful-login IPs (security report + UI IP report)
+            info["ssh_failed_sources"] = activity["failed_sources"]
+            info["ssh_accepted_sources"] = activity["accepted_sources"]
         if updates is not None:
             info["updates_pending"] = updates
 

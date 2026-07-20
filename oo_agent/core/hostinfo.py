@@ -40,6 +40,10 @@ def _machine_id() -> str:
                 continue
     if not raw:
         raw = socket.gethostname()
+    # Mix in the hostname: VM clones from one image share an IDENTICAL
+    # /etc/machine-id, so without this two different servers would yield the
+    # same fingerprint and the second one could not enroll (409 "already bound").
+    raw = f"{raw}|{socket.gethostname()}"
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
